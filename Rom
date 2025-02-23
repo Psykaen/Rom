@@ -1,0 +1,1732 @@
+import pandas as pd
+import os
+from pathlib import Path
+from datetime import datetime
+from termcolor import colored
+from tqdm import tqdm
+import sys
+import numpy as np
+import re
+
+def print_status(besked, type='info'):
+    """
+    Printer farvet status besked
+    """
+    farver = {
+        'info': 'cyan',
+        'success': 'green',
+        'warning': 'yellow',
+        'error': 'red'
+    }
+    print(colored(besked, farver.get(type, 'white')))
+
+def udtræk_dato_fra_sti(filsti):
+    """
+    Udtrækker dato fra filstien baseret på mappestrukturen
+    Eksempel: "Butik/2025/Februar/1.xlsx" -> 2025-02-01
+    """
+    try:
+        dele = Path(filsti).parts
+        filnavn = Path(filsti).stem  # Får filnavnet uden extension (1 i stedet for 1.xlsx)
+        
+        # Find år og måned fra mappestien
+        år = None
+        måned = None
+        
+        # Tilføj 'feburar' som alternativ stavemåde
+        måneder = {
+            'januar': '01', 'februar': '02', 'marts': '03', 'april': '04',
+            'maj': '05', 'juni': '06', 'juli': '07', 'august': '08',
+            'september': '09', 'oktober': '10', 'november': '11', 'december': '12',
+            'feburar': '02'  # Tilføjet alternativ stavemåde
+        }
+        
+        for sti_del in dele:
+            # Find året
+            if sti_del.isdigit() and len(sti_del) == 4:
+                år = sti_del
+            # Find måneden (tjek både korrekt og alternativ stavemåde)
+            if sti_del.lower() in måneder:
+                måned = sti_del.lower()
+        
+        # Hvis filnavnet er et tal mellem 1 og 31, brug det som dag
+        if filnavn.isdigit() and 1 <= int(filnavn) <= 31:
+            dag = filnavn.zfill(2)  # Sikrer at dagen altid er to cifre (1 -> 01)
+            
+            if år and måned:
+                return f"{år}-{måneder[måned]}-{dag}"
+            
+        print_status(f"Mangler år eller måned for fil: {filsti}", 'warning')
+        
+    except Exception as e:
+        print_status(f"Fejl ved behandling af fil: {filsti} - {str(e)}", 'error')
+    
+    return None
+
+def læs_salgsdata(mappe_sti):
+    """
+    Læser alle Excel og CSV-filer i den angivne mappe og undermapper
+    """
+    salgsdata = []
+    
+    # Håndter mellemrum i stien
+    mappe_path = Path(mappe_sti.replace('\\', ''))
+    
+    if not mappe_path.exists():
+        print_status(f"Fejl: Mappen findes ikke: {mappe_sti}", 'error')
+        return salgsdata
+    
+    # Find alle relevante filer først
+    filer = list(mappe_path.rglob('*.[cx][ls][sx]*'))
+    
+    if not filer:
+        print_status("Ingen relevante filer fundet", 'warning')
+        return salgsdata
+    
+    print_status(f"Fundet {len(filer)} filer at behandle", 'info')
+    
+    # Opret fremskridtsbjælke
+    with tqdm(total=len(filer), desc="Læser filer", unit="fil") as pbar:
+        for fil in filer:
+            try:
+                salgsdato = udtræk_dato_fra_sti(fil)
+                
+                if salgsdato:
+                    pbar.set_description(f"Læser {fil.name}")
+                    
+                    try:
+                        if fil.suffix.lower() in ['.xlsx', '.xls']:
+                            df = pd.read_excel(fil)
+                        else:
+                            df = pd.read_csv(fil)
+                        
+                        if isinstance(df, pd.DataFrame) and not df.empty:
+                            salgsdata.append({
+                                'filnavn': fil.name,
+                                'dato': salgsdato,
+                                'data': df,
+                                'sti': str(fil)
+                            })
+                            print_status(f"Tilføjet data for fil: {fil.name}", 'info')
+                        else:
+                            print_status(f"Tom eller ugyldig fil: {fil.name}", 'warning')
+                            continue
+                            
+                    except Exception as e:
+                        pbar.set_postfix_str(f"Fejl ved læsning af fil: {str(e)}")
+                        continue
+                else:
+                    print_status(f"Fejl: Kunne ikke identificere dato for {fil.name}", 'warning')
+                    
+            except Exception as e:
+                pbar.set_postfix_str(f"Fejl: {str(e)}")
+            
+            pbar.update(1)
+    
+    # Filtrer ugyldige data væk og sorter
+    valid_data = [item for item in salgsdata if isinstance(item, dict) and 'dato' in item and 'data' in item]
+    valid_data.sort(key=lambda x: x['dato'])
+    
+    print_status(f"\nSuccessfuldt indlæst {len(valid_data)} af {len(filer)} filer", 'success')
+    return valid_data
+
+def analysér_salgsdata(df):
+    try:
+        # Først, print de originale kolonnenavne
+        print_status(f"Originale kolonner: {list(df.columns)}", 'info')
+        
+        # Konverter kolonnenavne til lowercase og fjern mellemrum
+        df.columns = [col.lower().replace(' ', '') for col in df.columns]
+        
+        # Map de korrekte kolonnenavne
+        kolonne_mapping = {
+            'produktnavnkategori': 'produktnavn',  # Dette er kombineret i din Excel
+            'salg': 'salg',
+            'rabat': 'rabat',
+            'ialt': 'i alt'  # Dette kan være 'i alt' eller 'ialt' i Excel
+        }
+        
+        # Omdøb kolonnerne
+        df = df.rename(columns=kolonne_mapping)
+        
+        # Tjek at vi har de nødvendige kolonner
+        nødvendige_kolonner = ['produktnavn', 'salg', 'rabat', 'i alt']
+        for kolonne in nødvendige_kolonner:
+            if kolonne not in df.columns:
+                return None, f"Mangler kolonne: {kolonne}"
+        
+        # Tjek datatyper
+        for kolonne in ['salg', 'rabat', 'i alt']:
+            if kolonne in df.columns:
+                df[kolonne] = pd.to_numeric(df[kolonne], errors='coerce')
+        
+        # Returner data direkte
+        return df, None
+        
+    except Exception as e:
+        return None, f"Fejl under analyse af data: {str(e)}"
+
+def vis_salgsstatistik(data):
+    """
+    Viser statistik for de indlæste salgsdata
+    """
+    if not data:
+        print_status("Ingen salgsdata fundet", 'warning')
+        return
+    
+    print_status("\nSalgsdata oversigt:", 'info')
+    print("="*50)
+    
+    # Gruppér efter dato
+    datoer = {}
+    for item in data:
+        dato = item['dato']
+        if dato not in datoer:
+            datoer[dato] = []
+        datoer[dato].append(item)
+    
+    # Opret fremskridtsbjælke for datoer
+    for dato in tqdm(sorted(datoer.keys()), desc="Analyserer datoer", unit="dato"):
+        print_status(f"\nDato: {dato}", 'info')
+        total_salg = 0
+        total_rabat = 0
+        
+        for item in tqdm(datoer[dato], desc="Behandler filer", leave=False):
+            df = item['data']
+            print_status(f"\n  Fil: {item['filnavn']}", 'info')
+            
+            try:
+                analyseret_data, fejl = analysér_salgsdata(df)
+                
+                if fejl:
+                    print_status(f"  Advarsel: {fejl}", 'warning')
+                    continue
+                
+                if analyseret_data is not None:
+                    fundne_kolonner = list(analyseret_data.columns)
+                    print_status(f"  Fundne kolonner: {', '.join(fundne_kolonner)}", 'info')
+                    
+                    if 'i alt' in analyseret_data.columns:
+                        dagens_salg = analyseret_data['i alt'].sum()
+                        total_salg += dagens_salg
+                        print_status(f"  Total salg: {dagens_salg:.2f} kr", 'success')
+                    
+                    if 'rabat' in analyseret_data.columns:
+                        dagens_rabat = analyseret_data['rabat'].sum()
+                        total_rabat += dagens_rabat
+                        print_status(f"  Total rabat: {dagens_rabat:.2f} kr", 'warning')
+                
+            except Exception as e:
+                print_status(f"  Fejl ved behandling af fil: {str(e)}", 'error')
+                continue
+        
+        print_status(f"Dagstotaler for {dato} - Salg: {total_salg}, Rabat: {total_rabat}", 'info')
+
+def formater_dato(dato_str):
+    """
+    Konverterer dato fra '2025-01-01' til '1. Januar 2025'
+    """
+    måneder = {
+        '01': 'Januar',
+        '02': 'Februar',
+        '03': 'Marts',
+        '04': 'April',
+        '05': 'Maj',
+        '06': 'Juni',
+        '07': 'Juli',
+        '08': 'August',
+        '09': 'September',
+        '10': 'Oktober',
+        '11': 'November',
+        '12': 'December'
+    }
+    
+    try:
+        år, måned, dag = dato_str.split('-')
+        dag = str(int(dag))  # Fjerner foranstillede nuller
+        return f"{dag}. {måneder[måned]} {år}"
+    except:
+        return dato_str
+
+def gem_salgsrapport(data, output_sti):
+    print_status("\nGenererer Excel rapport...", 'info')
+    
+    if not data:
+        print_status("Ingen data at gemme", 'warning')
+        return
+        
+    try:
+        print_status("DEBUG: Starter Excel writer", 'info')
+        # Debug data struktur
+        print_status(f"DEBUG: Type af data: {type(data)}", 'info')
+        print_status(f"DEBUG: Antal elementer i data: {len(data)}", 'info')
+        
+        # Filtrer ugyldige elementer fra data
+        valid_data = [item for item in data if isinstance(item, dict) and 'data' in item]
+        print_status(f"DEBUG: Antal gyldige elementer: {len(valid_data)}", 'info')
+        
+        with pd.ExcelWriter(output_sti, engine='xlsxwriter') as writer:
+            workbook = writer.book
+            workbook.nan_inf_to_errors = True
+            
+            # Tilføj Top 20 analyser til rapporten
+            try:
+                tilføj_top20_analyser(workbook, valid_data)
+            except Exception as e:
+                print_status(f"Fejl ved tilføjelse af Top 20 analyser: {str(e)}", 'warning')
+            
+            # Moderne header format
+            header_format = workbook.add_format({
+                'bold': True,
+                'bg_color': '#1a237e',
+                'font_color': 'white',
+                'border': 0,
+                'align': 'center',
+                'font_size': 12,
+                'font_name': 'Helvetica Neue',
+                'bottom': 2,
+                'bottom_color': '#E0E0E0'
+            })
+            
+            # Fjern kommentar der kalder top_sælgende_produkter
+            # top_sælgende_produkter(data, workbook, header_format)
+            
+            # Andre formater (behold de eksisterende formater)
+            måned_format_1 = workbook.add_format({
+                'bg_color': '#f5f7fa',
+                'num_format': '#,##0.00 kr',
+                'align': 'right',
+                'border': 0,
+                'font_name': 'Helvetica Neue',
+                'font_size': 11,
+                'bottom': 1,
+                'bottom_color': '#E0E0E0'
+            })
+            
+            måned_format_2 = workbook.add_format({
+                'bg_color': '#FFFFFF',
+                'num_format': '#,##0.00 kr',
+                'align': 'right',
+                'border': 0,
+                'font_name': 'Helvetica Neue',
+                'font_size': 11,
+                'bottom': 1,
+                'bottom_color': '#E0E0E0'
+            })
+            
+            # Tilføj nyt format for antal (uden kr)
+            antal_format_1 = workbook.add_format({
+                'bg_color': '#f5f7fa',
+                'num_format': '#,##0',  # Kun tal uden kr
+                'align': 'right',
+                'border': 0,
+                'font_name': 'Helvetica Neue',
+                'font_size': 11,
+                'bottom': 1,
+                'bottom_color': '#E0E0E0'
+            })
+            
+            antal_format_2 = workbook.add_format({
+                'bg_color': '#FFFFFF',
+                'num_format': '#,##0',  # Kun tal uden kr
+                'align': 'right',
+                'border': 0,
+                'font_name': 'Helvetica Neue',
+                'font_size': 11,
+                'bottom': 1,
+                'bottom_color': '#E0E0E0'
+            })
+            
+            # Definer måneder_kort
+            måneder_kort = {
+                '01': 'Jan',
+                '02': 'Feb',
+                '03': 'Mar',
+                '04': 'Apr',
+                '05': 'Maj',
+                '06': 'Jun',
+                '07': 'Jul',
+                '08': 'Aug',
+                '09': 'Sep',
+                '10': 'Okt',
+                '11': 'Nov',
+                '12': 'Dec'
+            }
+            
+            # Organiser data efter måneder
+            måneder_data = {}
+            for item in valid_data:
+                dato = item['dato']
+                år, måned, _ = dato.split('-')
+                måned_key = f"{måneder_kort[måned]} {år[2:]}"
+                
+                if måned_key not in måneder_data:
+                    måneder_data[måned_key] = []
+                måneder_data[måned_key].append(item)
+            
+            # For hver måned, opret to ark
+            for måned_navn, måned_data in måneder_data.items():
+                # Opret månedsoversigt ark
+                worksheet = workbook.add_worksheet(måned_navn)
+                
+                # Anvend formatering
+                worksheet.set_row(0, 25)
+                worksheet.hide_gridlines(2)
+                worksheet.set_tab_color('#1a237e')
+                worksheet.freeze_panes(1, 0)
+                worksheet.set_zoom(100)
+                
+                # Opret månedsoversigt
+                # Saml data for denne måned
+                daglig_data = []
+                for item in måned_data:
+                    df = item['data']
+                    df.columns = [col.lower().strip() for col in df.columns]
+                    
+                    # Filtrer rækker der indeholder 'total'
+                    df_uden_total = df[~df['produktnavn'].str.lower().str.contains('total', na=False)]
+                    
+                    dato = item['dato']
+                    daglig_data.append({
+                        'Dato': formater_dato(dato),
+                        'Antal Enheder': df_uden_total['salg'].sum(),
+                        'Total Rabat': df_uden_total['rabat'].sum(),
+                        'Omsætning': df_uden_total['i alt'].sum()
+                    })
+                
+                # Konverter til DataFrame og sorter efter dato
+                df_daglig = pd.DataFrame(daglig_data)
+                
+                # Skriv overskrifter for månedsoversigt
+                headers = ['Dato', 'Antal Enheder', 'Total Rabat', 'Omsætning']
+                for col_num, value in enumerate(headers):
+                    worksheet.write(0, col_num, value, header_format)
+                
+                # Skriv månedsoversigt data
+                for row_num, row in enumerate(df_daglig.values, start=1):
+                    row_is_even = row_num % 2 == 0
+                    for col_num, value in enumerate(row):
+                        if col_num == 0:  # Dato kolonne
+                            format = måned_format_1 if row_is_even else måned_format_2
+                        elif col_num == 1:  # Antal Enheder
+                            format = antal_format_1 if row_is_even else antal_format_2
+                        else:  # Beløb kolonner
+                            format = måned_format_1 if row_is_even else måned_format_2
+                        worksheet.write(row_num, col_num, value, format)
+                
+                # Tilføj sum i bunden af månedsoversigt
+                sidste_række = len(df_daglig) + 2
+                worksheet.write(sidste_række, 0, 'I alt', header_format)
+                total_omsætning = float(df_daglig['Omsætning'].sum())
+                worksheet.write(sidste_række, 3, total_omsætning, måned_format_1)
+                
+                # Udfyld resten af 'I alt' rækken
+                for col in range(1, 3):
+                    worksheet.write(sidste_række, col, '', måned_format_1)
+                
+                # Tilføj Top 20 analyse hvis det er Jan 25
+                if måned_navn == 'Jan 25':
+                    sidste_række = tilføj_top20_til_måned(worksheet, måned_data, workbook, sidste_række)
+                
+                # For månedsoversigten - Autofit kolonner
+                for col_num, header in enumerate(headers):
+                    # Find maksimal bredde for kolonnen
+                    max_width = len(str(header)) + 2  # Start med header længde + buffer
+                    
+                    # Tjek alle værdier i kolonnen
+                    for row in df_daglig.values:
+                        width = len(str(row[col_num])) + 2
+                        max_width = max(width, max_width)
+                    
+                    # Sæt kolonnebredde (max 50, min 8)
+                    worksheet.set_column(col_num, col_num, min(max(max_width, 8), 50))
+
+                # Opret separat produktoversigt ark
+                produkt_ark_navn = f'Produkter {måned_navn}'
+                worksheet_produkter = workbook.add_worksheet(produkt_ark_navn)
+                
+                # Anvend formatering for produktarket
+                worksheet_produkter.set_row(0, 25)
+                worksheet_produkter.hide_gridlines(2)
+                worksheet_produkter.set_tab_color('#1a237e')
+                worksheet_produkter.freeze_panes(1, 0)
+                worksheet_produkter.set_zoom(100)
+                
+                # Skriv overskrifter for produktoversigt
+                produkt_headers = ['Produktnavn', 'Kategori', 'Antal Solgt', 'Total Rabat', 'Omsætning']
+                for col, header in enumerate(produkt_headers):
+                    worksheet_produkter.write(0, col, header, header_format)
+                
+                # Saml produktdata
+                print_status("\nDEBUG: Starter behandling af produktdata for måned", 'info')
+                print_status(f"DEBUG: Behandler måned: {måned_navn}", 'info')
+                
+                produkt_data = {}
+                for item in måned_data:
+                    df = item['data']
+                    print_status(f"DEBUG: Kolonner i DataFrame: {df.columns.tolist()}", 'info')
+                    
+                    df.columns = [col.lower().strip() for col in df.columns]
+                    df_uden_total = df[~df['produktnavn'].str.lower().str.contains('total', na=False)]
+                    
+                    # Debug print for at se rå data
+                    print_status("\nDEBUG: Første få rækker af data:", 'info')
+                    print(df_uden_total.head())
+                    
+                    for _, row in df_uden_total.iterrows():
+                        produkt = str(row['produktnavn']).strip()
+                        
+                        # Debug print for problematiske værdier
+                        if pd.isna(produkt) or produkt == 'nan':
+                            print_status(f"DEBUG: Fandt ugyldig produktnavn: {produkt}", 'warning')
+                            print_status(f"DEBUG: Fuld række: {row.to_dict()}", 'warning')
+                            continue
+                        
+                        # Brug det korrekte kolonnenavn 'kategorinavn'
+                        kategori = str(row['kategorinavn']).strip()
+                        
+                        # Debug print for kategorier
+                        if pd.isna(kategori) or kategori == 'nan':
+                            print_status(f"DEBUG: Fandt ugyldig kategori for produkt {produkt}: {kategori}", 'warning')
+                        
+                        # Hvis kategorien er tom eller NaN, brug 'Ingen kategori'
+                        if pd.isna(kategori) or not kategori or kategori == 'nan':
+                            kategori = 'Ingen kategori'
+                        
+                        # Validér numeriske værdier før de tilføjes
+                        try:
+                            salg = float(row['salg']) if pd.notna(row['salg']) else 0
+                            rabat = float(row['rabat']) if pd.notna(row['rabat']) else 0
+                            omsætning = float(row['i alt']) if pd.notna(row['i alt']) else 0
+                        except ValueError as e:
+                            print_status(f"DEBUG: Fejl ved konvertering af tal for produkt {produkt}: {e}", 'error')
+                            continue
+                        
+                        if produkt not in produkt_data:
+                            produkt_data[produkt] = {
+                                'kategori': kategori,
+                                'antal': 0,
+                                'rabat': 0,
+                                'omsætning': 0
+                            }
+                        produkt_data[produkt]['antal'] += salg
+                        produkt_data[produkt]['rabat'] += rabat
+                        produkt_data[produkt]['omsætning'] += omsætning
+                
+                # Debug print før sortering og skrivning
+                print_status("\nDEBUG: Produktdata før sortering:", 'info')
+                for produkt, data in produkt_data.items():
+                    if 'nan' in str(produkt).lower() or 'nan' in str(data['kategori']).lower():
+                        print_status(f"DEBUG: Problematisk produkt fundet: {produkt} - {data}", 'warning')
+                
+                # Skriv produktdata
+                for række, (produkt, data) in enumerate(sorted(produkt_data.items(), key=lambda x: x[1]['antal'], reverse=True), start=1):
+                    row_is_even = række % 2 == 0
+                    # Skriv produktnavn
+                    worksheet_produkter.write(række, 0, produkt, måned_format_1 if row_is_even else måned_format_2)
+                    # Skriv kategori
+                    worksheet_produkter.write(række, 1, data['kategori'], måned_format_1 if row_is_even else måned_format_2)
+                    # Skriv antal (uden kr)
+                    worksheet_produkter.write(række, 2, data['antal'], antal_format_1 if row_is_even else antal_format_2)
+                    worksheet_produkter.write(række, 3, data['rabat'], måned_format_1 if row_is_even else måned_format_2)
+                    worksheet_produkter.write(række, 4, data['omsætning'], måned_format_1 if row_is_even else måned_format_2)
+                
+                # Tilføj sum i bunden af produktoversigten
+                produkt_sidste_række = len(produkt_data) + 2
+                worksheet_produkter.write(produkt_sidste_række, 0, 'I alt', header_format)
+                worksheet_produkter.write(produkt_sidste_række, 1, '', header_format)
+                
+                # Beregn og skriv totaler
+                total_antal = sum(data['antal'] for data in produkt_data.values())
+                total_rabat = sum(data['rabat'] for data in produkt_data.values())
+                total_oms = sum(data['omsætning'] for data in produkt_data.values())
+                
+                worksheet_produkter.write(produkt_sidste_række, 2, float(total_antal), antal_format_1)
+                worksheet_produkter.write(produkt_sidste_række, 3, float(total_rabat), måned_format_1)
+                worksheet_produkter.write(produkt_sidste_række, 4, float(total_oms), måned_format_1)
+                
+                # For produktoversigten - Autofit kolonner
+                for col_num, header in enumerate(produkt_headers):
+                    # Find maksimal bredde for kolonnen
+                    max_width = len(str(header)) + 2  # Start med header længde + buffer
+                    
+                    # Tjek alle værdier i kolonnen
+                    for produkt, data in produkt_data.items():
+                        if col_num == 0:  # Produktnavn
+                            width = len(str(produkt)) + 2
+                        elif col_num == 1:  # Kategori
+                            width = len(str(data['kategori'])) + 2
+                        elif col_num == 2:  # Antal
+                            width = len(str(data['antal'])) + 2
+                        elif col_num == 3:  # Rabat
+                            width = len(str(data['rabat'])) + 4  # Ekstra plads til valuta
+                        else:  # Omsætning
+                            width = len(str(data['omsætning'])) + 4  # Ekstra plads til valuta
+                        max_width = max(width, max_width)
+                    
+                    # Sæt kolonnebredde (max 50, min 8)
+                    worksheet_produkter.set_column(col_num, col_num, min(max(max_width, 8), 50))
+
+            print_status("DEBUG: Opretter kategori ark", 'info')
+            worksheet_kategorier = workbook.add_worksheet('Kategori Oversigt')
+            
+            print_status("DEBUG: Starter dataindsamling", 'info')
+            # Saml data per kategori og produkt
+            kategori_data = {}
+            for item in valid_data:
+                df = item['data']
+                
+                # Konverter kolonnenavne til lowercase
+                df.columns = [col.lower().strip() for col in df.columns]
+                
+                # Tjek nødvendige kolonner
+                if not all(col in df.columns for col in ['kategorinavn', 'produktnavn', 'salg', 'rabat', 'i alt']):
+                    print_status(f"DEBUG: Manglende kolonner i {item['filnavn']}", 'warning')
+                    print_status(f"DEBUG: Tilgængelige kolonner: {df.columns.tolist()}", 'info')
+                    continue
+                
+                # Filtrer total rækker
+                df = df[~df['produktnavn'].str.lower().str.contains('total', na=False)]
+                
+                # Gruppér efter kategori og produkt
+                for _, row in df.iterrows():
+                    try:
+                        kategori = str(row['kategorinavn']).strip()
+                        produkt = str(row['produktnavn']).strip()
+                        if pd.isna(kategori) or not kategori:
+                            kategori = 'Ingen kategori'
+                        
+                        if kategori not in kategori_data:
+                            kategori_data[kategori] = {}
+                        
+                        if produkt not in kategori_data[kategori]:
+                            kategori_data[kategori][produkt] = {
+                                'antal': 0,
+                                'rabat': 0,
+                                'omsætning': 0
+                            }
+                        
+                        # Konverter værdier sikkert
+                        salg = float(row['salg']) if pd.notna(row['salg']) else 0
+                        rabat = float(row['rabat']) if pd.notna(row['rabat']) else 0
+                        omsætning = float(row['i alt']) if pd.notna(row['i alt']) else 0
+                        
+                        # Opdater produkt data
+                        kategori_data[kategori][produkt]['antal'] += salg
+                        kategori_data[kategori][produkt]['rabat'] += rabat
+                        kategori_data[kategori][produkt]['omsætning'] += omsætning
+                        
+                    except Exception as e:
+                        print_status(f"DEBUG: Fejl ved behandling af række: {str(e)}", 'error')
+                        continue
+
+            # Debug output for kategorier og produkter
+            print_status("\nDEBUG: Fundne kategorier og produkter:", 'info')
+            for kategori, produkter in kategori_data.items():
+                print_status(f"Kategori: {kategori}", 'info')
+                for produkt, data in produkter.items():
+                    print_status(
+                        f"  Produkt: {produkt:<30} "
+                        f"Antal: {data['antal']:>6.0f} "
+                        f"Omsætning: {data['omsætning']:>10.2f} kr", 
+                        'info'
+                    )
+            print_status(f"Total antal kategorier: {len(kategori_data)}", 'info')
+            print_status("=" * 50, 'info')
+
+            if not kategori_data:
+                print_status("Ingen kategori data indsamlet!", 'error')
+                return
+
+            # Filtrer ud "Pre-Pack" kategorier fra rapporten
+            kategori_data = {k: v for k, v in kategori_data.items() if "pre-pack" not in k.lower()}
+
+            # Skriv data til Excel
+            worksheet_kategorier.write(0, 0, 'Kategori', header_format)
+            worksheet_kategorier.write(0, 1, 'Produktnavn', header_format)
+            worksheet_kategorier.write(0, 2, 'Antal Solgte Enheder', header_format)
+            worksheet_kategorier.write(0, 3, 'Total Rabat', header_format)
+            worksheet_kategorier.write(0, 4, 'Total Omsætning', header_format)
+
+            # Sorter og skriv kategori og produkt data
+            current_row = 1
+            for kategori, produkter in sorted(kategori_data.items()):
+                # Skriv kategori navn
+                worksheet_kategorier.write(current_row, 0, kategori, header_format)
+                current_row += 1
+                
+                # Skriv produkter under hver kategori
+                for produkt, data in sorted(produkter.items(), key=lambda x: x[1]['omsætning'], reverse=True):
+                    row_is_even = current_row % 2 == 0
+                    format_normal = måned_format_2 if row_is_even else måned_format_1
+                    format_antal = antal_format_2 if row_is_even else antal_format_1
+                    
+                    worksheet_kategorier.write(current_row, 1, produkt, format_normal)
+                    worksheet_kategorier.write(current_row, 2, data['antal'], format_antal)
+                    worksheet_kategorier.write(current_row, 3, data['rabat'], format_normal)
+                    worksheet_kategorier.write(current_row, 4, data['omsætning'], format_normal)
+                    current_row += 1
+
+                # Tilføj en tom række mellem kategorier
+                current_row += 1
+
+            # Juster kolonnebredder
+            worksheet_kategorier.set_column(0, 0, 30)  # Kategori
+            worksheet_kategorier.set_column(1, 1, 30)  # Produktnavn
+            worksheet_kategorier.set_column(2, 2, 20)  # Antal
+            worksheet_kategorier.set_column(3, 4, 20)  # Beløb kolonner
+
+            # Tilføj månedlig analyse
+            tilføj_månedlige_analyser(workbook, måned_data, måned_navn)
+
+            # Opret nyt ark for ugedagsanalyse
+            worksheet_ugedage = workbook.add_worksheet('Ugedagsanalyse')
+            
+            # Anvend formatering
+            header_format = workbook.add_format({
+                'bold': True,
+                'bg_color': '#1a237e',
+                'font_color': 'white',
+                'border': 0,
+                'align': 'center',
+                'font_size': 12,
+                'font_name': 'Helvetica Neue',
+                'bottom': 2,
+                'bottom_color': '#E0E0E0'
+            })
+
+            # Tilføj talformat for omsætning
+            beløb_format = workbook.add_format({
+                'num_format': '#,##0.00 kr',
+                'align': 'right',
+                'font_name': 'Helvetica Neue',
+                'font_size': 11
+            })
+            
+            # Skriv overskrifter
+            worksheet_ugedage.write(0, 0, 'Ugedag', header_format)
+            worksheet_ugedage.write(0, 1, 'Omsætning', header_format)
+            
+            # Hent ugedagsdata - brug valid_data i stedet for data
+            ugedags_omsætning = analyser_ugedags_omsætning(valid_data)
+            
+            # Skriv data med korrekt formatering
+            row = 1
+            for ugedag, omsætning in sorted(ugedags_omsætning.items()):
+                worksheet_ugedage.write(row, 0, ugedag)
+                worksheet_ugedage.write(row, 1, float(omsætning), beløb_format)  # Konverter til float og brug beløb_format
+                row += 1
+            
+            # Tilføj diagram
+            chart = workbook.add_chart({'type': 'column'})
+            chart.add_series({
+                'name': 'Omsætning',
+                'categories': f'=Ugedagsanalyse!$A$2:$A${row}',
+                'values': f'=Ugedagsanalyse!$B$2:$B${row}',
+            })
+            
+            # Konfigurer diagram
+            chart.set_title({'name': 'Omsætning pr. ugedag'})
+            chart.set_x_axis({'name': 'Ugedag'})
+            chart.set_y_axis({'name': 'Omsætning (kr)'})
+            
+            # Indsæt diagram
+            worksheet_ugedage.insert_chart('D2', chart, {'x_scale': 1.5, 'y_scale': 1.5})
+            
+            # Juster kolonnebredder
+            worksheet_ugedage.set_column(0, 0, 15)  # Ugedag kolonne
+            worksheet_ugedage.set_column(1, 1, 20)  # Omsætning kolonne
+            
+            print_status("Ugedagsanalyse tilføjet til rapporten", 'success')
+
+            # Tilføj forecast analyse
+            tilføj_forecast_analyse(workbook, måneder_data, header_format)
+
+        print_status(f"Rapport gemt til: {output_sti}", 'success')
+    
+    except Exception as e:
+        print_status(f"DEBUG: Kritisk fejl i rapport generering: {str(e)}", 'error')
+        import traceback
+        print_status(f"DEBUG: Stacktrace:\n{traceback.format_exc()}", 'error')
+
+def tilføj_top20_analyser(workbook, data):
+    """Tilføjer Top 20 analyser til Excel rapporten"""
+    try:
+        # Opret et nyt ark til Top 20 analyser
+        worksheet = workbook.add_worksheet('Top 20 Analyser')
+        worksheet.set_zoom(100)
+        worksheet.hide_gridlines(2)
+        worksheet.set_tab_color('#1a237e')
+        
+        # Formatering
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#1a237e',
+            'font_color': 'white',
+            'border': 0,
+            'align': 'center',
+            'font_size': 12,
+            'font_name': 'Helvetica Neue',
+            'bottom': 2,
+            'bottom_color': '#E0E0E0'
+        })
+        
+        data_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'right',
+            'num_format': '#,##0.00 kr'
+        })
+        
+        antal_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'right',
+            'num_format': '#,##0'
+        })
+        
+        # Saml al data
+        all_data = []
+        for item in data:
+            if not isinstance(item, dict) or 'data' not in item:
+                continue
+            df = item['data']
+            df['dato'] = item['dato']
+            all_data.append(df)
+        
+        if not all_data:
+            return
+        
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df.columns = [col.lower().strip() for col in combined_df.columns]
+        
+        # Filter out total rows before calculations
+        combined_df = combined_df[~combined_df['produktnavn'].str.lower().str.contains('total', na=False)]
+        
+        # 1. Top 20 bedst sælgende produkter
+        current_row = 0
+        worksheet.write(current_row, 0, 'Top 20 Bedst Sælgende Produkter', header_format)
+        worksheet.merge_range(current_row, 0, current_row, 3, 'Top 20 Bedst Sælgende Produkter', header_format)
+        current_row += 1
+        
+        # Skriv overskrifter
+        headers = ['Produkt', 'Antal Solgt', 'Total Omsætning', 'Gns. Pris']
+        for col, header in enumerate(headers):
+            worksheet.write(current_row, col, header, header_format)
+        current_row += 1
+        
+        # Beregn top 20 produkter
+        top_products = combined_df.groupby('produktnavn').agg({
+            'salg': 'sum',
+            'i alt': 'sum'
+        }).reset_index()
+        top_products['gns_pris'] = top_products['i alt'] / top_products['salg']
+        # Ændret: Sorter efter omsætning i stedet for antal solgt
+        top_products = top_products.nlargest(20, 'i alt')
+        
+        # Skriv produkt data
+        for _, row in top_products.iterrows():
+            worksheet.write(current_row, 0, row['produktnavn'])
+            worksheet.write(current_row, 1, row['salg'], antal_format)
+            worksheet.write(current_row, 2, row['i alt'], data_format)
+            worksheet.write(current_row, 3, row['gns_pris'], data_format)
+            current_row += 1
+        
+        current_row += 2
+        
+        # 2. Top 20 kategorier efter omsætning
+        worksheet.write(current_row, 0, 'Top 20 Kategorier Efter Omsætning', header_format)
+        worksheet.merge_range(current_row, 0, current_row, 2, 'Top 20 Kategorier Efter Omsætning', header_format)
+        current_row += 1
+        
+        # Skriv kategori overskrifter
+        headers = ['Kategori', 'Antal Produkter', 'Total Omsætning']
+        for col, header in enumerate(headers):
+            worksheet.write(current_row, col, header, header_format)
+        current_row += 1
+        
+        # Beregn top 20 kategorier
+        top_categories = combined_df.groupby('kategorinavn').agg({
+            'produktnavn': 'count',
+            'i alt': 'sum'
+        }).reset_index()
+        top_categories = top_categories.nlargest(20, 'i alt')
+        
+        # Skriv kategori data
+        for _, row in top_categories.iterrows():
+            worksheet.write(current_row, 0, row['kategorinavn'])
+            worksheet.write(current_row, 1, row['produktnavn'], antal_format)
+            worksheet.write(current_row, 2, row['i alt'], data_format)
+            current_row += 1
+        
+        current_row += 2
+        
+        # 3. Top 20 salgsdage
+        worksheet.write(current_row, 0, 'Top 20 Bedste Salgsdage', header_format)
+        worksheet.merge_range(current_row, 0, current_row, 3, 'Top 20 Bedste Salgsdage', header_format)
+        current_row += 1
+        
+        # Skriv salgsdage overskrifter
+        headers = ['Dato', 'Antal Salg', 'Total Omsætning', 'Gns. Ordrestørrelse']
+        for col, header in enumerate(headers):
+            worksheet.write(current_row, col, header, header_format)
+        current_row += 1
+        
+        # Beregn top 20 salgsdage
+        top_days = combined_df.groupby('dato').agg({
+            'produktnavn': 'count',
+            'i alt': 'sum'
+        }).reset_index()
+        top_days['gns_ordre'] = top_days['i alt'] / top_days['produktnavn']
+        top_days = top_days.nlargest(20, 'i alt')
+        
+        # Skriv salgsdage data
+        for _, row in top_days.iterrows():
+            worksheet.write(current_row, 0, formater_dato(row['dato']))
+            worksheet.write(current_row, 1, row['produktnavn'], antal_format)
+            worksheet.write(current_row, 2, row['i alt'], data_format)
+            worksheet.write(current_row, 3, row['gns_ordre'], data_format)
+            current_row += 1
+        
+        # Juster kolonnebredder
+        worksheet.set_column(0, 0, 40)  # Produkt/Kategori kolonne
+        worksheet.set_column(1, 3, 20)  # Andre kolonner
+        
+        print_status('Top 20 analyser tilføjet til rapporten', 'success')
+        
+    except Exception as e:
+        print_status(f'Fejl ved tilføjelse af Top 20 analyser: {str(e)}', 'error')
+
+def tilføj_månedlige_analyser(workbook, måned_data, måned_navn):
+    """
+    Tilføjer nye analyser til månedsfanerne
+    """
+    try:
+        # Opret nyt ark for månedlig analyse
+        worksheet_analyse = workbook.add_worksheet(f'Analyse {måned_navn}')
+        
+        # Anvend formatering
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#1a237e',
+            'font_color': 'white',
+            'border': 0,
+            'align': 'center',
+            'font_size': 12,
+            'font_name': 'Helvetica Neue',
+            'bottom': 2,
+            'bottom_color': '#E0E0E0'
+        })
+        
+        # 1. Månedlig salgstendens
+        worksheet_analyse.write(0, 0, 'Månedlig Salgstendens', header_format)
+        worksheet_analyse.write(1, 0, 'Dato')
+        worksheet_analyse.write(1, 1, 'Omsætning')
+        
+        # Saml daglige salg
+        daglig_salg = {}
+        for item in måned_data:
+            df = item['data']
+            df.columns = [col.lower().strip() for col in df.columns]
+            dato = item['dato']
+            daglig_salg[dato] = df['i alt'].sum()
+        
+        # Skriv salgstendens data
+        row = 2
+        for dato, omsætning in sorted(daglig_salg.items()):
+            worksheet_analyse.write(row, 0, formater_dato(dato))
+            worksheet_analyse.write(row, 1, omsætning)
+            row += 1
+        
+        # 2. Top 5 produkter
+        worksheet_analyse.write(row + 2, 0, 'Top 5 Produkter', header_format)
+        worksheet_analyse.write(row + 3, 0, 'Produkt')
+        worksheet_analyse.write(row + 3, 1, 'Omsætning')
+        
+        # Saml produktdata
+        produkt_salg = {}
+        for item in måned_data:
+            df = item['data']
+            df.columns = [col.lower().strip() for col in df.columns]
+            for _, row_data in df.iterrows():
+                produkt = row_data['produktnavn']
+                omsætning = row_data['i alt']
+                if produkt not in produkt_salg:
+                    produkt_salg[produkt] = 0
+                produkt_salg[produkt] += omsætning
+        
+        # Skriv top 5 produkter
+        top_produkter = sorted(produkt_salg.items(), key=lambda x: x[1], reverse=True)[:5]
+        row += 4
+        for produkt, omsætning in top_produkter:
+            worksheet_analyse.write(row, 0, produkt)
+            worksheet_analyse.write(row, 1, omsætning)
+            row += 1
+        
+        # 3. Rabatanalyse
+        worksheet_analyse.write(row + 2, 0, 'Rabatanalyse', header_format)
+        worksheet_analyse.write(row + 3, 0, 'Rabatinterval')
+        worksheet_analyse.write(row + 3, 1, 'Antal Salg')
+        
+        # Saml rabatdata
+        rabat_intervaller = {
+            '0-10%': 0,
+            '10-20%': 0,
+            '20-30%': 0,
+            '30-50%': 0,
+            '50%+': 0
+        }
+        
+        for item in måned_data:
+            df = item['data']
+            df.columns = [col.lower().strip() for col in df.columns]
+            for _, row_data in df.iterrows():
+                rabat = row_data['rabat']
+                if rabat <= 10:
+                    rabat_intervaller['0-10%'] += 1
+                elif rabat <= 20:
+                    rabat_intervaller['10-20%'] += 1
+                elif rabat <= 30:
+                    rabat_intervaller['20-30%'] += 1
+                elif rabat <= 50:
+                    rabat_intervaller['30-50%'] += 1
+                else:
+                    rabat_intervaller['50%+'] += 1
+        
+        # Skriv rabatdata
+        row += 4
+        for interval, antal in rabat_intervaller.items():
+            worksheet_analyse.write(row, 0, interval)
+            worksheet_analyse.write(row, 1, antal)
+            row += 1
+        
+        # 4. Kategorioversigt
+        worksheet_analyse.write(row + 2, 0, 'Kategorioversigt', header_format)
+        worksheet_analyse.write(row + 3, 0, 'Kategori')
+        worksheet_analyse.write(row + 3, 1, 'Omsætning')
+        
+        # Saml kategoridata
+        kategori_salg = {}
+        for item in måned_data:
+            df = item['data']
+            df.columns = [col.lower().strip() for col in df.columns]
+            for _, row_data in df.iterrows():
+                kategori = row_data['kategorinavn']
+                omsætning = row_data['i alt']
+                if kategori not in kategori_salg:
+                    kategori_salg[kategori] = 0
+                kategori_salg[kategori] += omsætning
+        
+        # Skriv kategoridata
+        row += 4
+        for kategori, omsætning in sorted(kategori_salg.items(), key=lambda x: x[1], reverse=True):
+            worksheet_analyse.write(row, 0, kategori)
+            worksheet_analyse.write(row, 1, omsætning)
+            row += 1
+        
+        # Tilføj Top 20 analyser
+        row = tilføj_top20_til_måned(worksheet_analyse, måned_data, workbook, row)
+        
+        # Juster kolonnebredder
+        worksheet_analyse.set_column(0, 0, 30)
+        worksheet_analyse.set_column(1, 1, 20)
+        
+        print_status(f"Analyseark tilføjet for {måned_navn}", 'success')
+    
+    except Exception as e:
+        print_status(f"Fejl ved tilføjelse af månedlig analyse: {str(e)}", 'error')
+
+def interaktiv_pre_pack_kategorisering(data):
+    pre_pack_produkter = {}
+
+    # Prøv at læse eksisterende valg fra CSV, hvis den findes
+    try:
+        pre_pack_df = pd.read_csv('pre_pack_kategorisering.csv')
+        pre_pack_produkter = pre_pack_df.set_index('Produktnavn')['Kategori'].to_dict()
+        print_status("Eksisterende pre-pack kategorisering indlæst.", 'info')
+    except FileNotFoundError:
+        print_status("Ingen eksisterende pre-pack kategorisering fundet. Starter ny.", 'info')
+
+    for item in data:
+        df = item['data']
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        for _, row in df.iterrows():
+            kategori = str(row['kategorinavn']).strip().lower()
+            produkt = str(row['produktnavn']).strip()
+            
+            if "pre-pack" in kategori:
+                if produkt not in pre_pack_produkter:
+                    while True:
+                        print(f"Produkt: {produkt}")
+                        valg = input("Vælg kategori (Blomst/Solid): ").strip().lower()
+                        if valg in ['blomst', 'solid']:
+                            pre_pack_produkter[produkt] = valg.capitalize()
+                            # Gem valget med det samme
+                            pd.DataFrame(list(pre_pack_produkter.items()), columns=['Produktnavn', 'Kategori']).to_csv('pre_pack_kategorisering.csv', index=False)
+                            print_status(f"Valg gemt for produkt: {produkt}", 'success')
+                            break
+                        else:
+                            print("Ugyldigt valg. Prøv igen.")
+
+    print_status("Alle pre-pack produktvalg er gemt.", 'success')
+
+def anvend_pre_pack_kategorisering(data):
+    # Læs den opdaterede CSV
+    try:
+        pre_pack_kategorisering = pd.read_csv('pre_pack_kategorisering.csv')
+        pre_pack_dict = pre_pack_kategorisering.set_index('Produktnavn')['Kategori'].to_dict()
+        print_status("Pre-pack kategorisering anvendt fra CSV.", 'info')
+    except FileNotFoundError:
+        print_status("Ingen pre-pack kategorisering fundet. Ingen ændringer anvendt.", 'warning')
+        return
+
+    for item in data:
+        if not isinstance(item, dict) or 'data' not in item:
+            print_status(f"Ugyldigt dataelement: {item}", 'warning')
+            continue
+
+        df = item['data']
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        for _, row in df.iterrows():
+            kategori = str(row['kategorinavn']).strip().lower()
+            produkt = str(row['produktnavn']).strip()
+            
+            if "pre-pack" in kategori:
+                # Brug den opdaterede kategori fra CSV
+                if produkt in pre_pack_dict:
+                    row['kategorinavn'] = pre_pack_dict[produkt]
+
+def analyser_kategori_omsætning(data):
+    """
+    Analyserer omsætning pr. kategori pr. måned
+    Returnerer en dictionary med måned som nøgle og kategoriomsætning som værdi
+    """
+    kategori_omsætning = {}
+    
+    for item in data:
+        if not isinstance(item, dict) or 'data' not in item:
+            continue
+            
+        df = item['data']
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        # Hent dato og ekstraher måned
+        dato = item['dato']
+        år, måned, _ = dato.split('-')
+        måned_nøgle = f"{år}-{måned}"
+        
+        # Initialiser måned i dictionary hvis den ikke findes
+        if måned_nøgle not in kategori_omsætning:
+            kategori_omsætning[måned_nøgle] = {}
+        
+        # Gruppér efter kategori og sum omsætning
+        for _, row in df.iterrows():
+            kategori = str(row['kategorinavn']).strip()
+            if pd.isna(kategori) or not kategori:
+                kategori = 'Ingen kategori'
+            
+            omsætning = row['i alt']
+            
+            if kategori not in kategori_omsætning[måned_nøgle]:
+                kategori_omsætning[måned_nøgle][kategori] = 0
+            kategori_omsætning[måned_nøgle][kategori] += omsætning
+    
+    return kategori_omsætning
+
+def vis_top_kategorier(data):
+    """
+    Viser de bedst omsættende kategorier pr. måned
+    """
+    kategori_omsætning = analyser_kategori_omsætning(data)
+    
+    if not kategori_omsætning:
+        print_status("Ingen kategori data fundet", 'warning')
+        return
+    
+    print_status("\nTop omsættende kategorier pr. måned:", 'info')
+    print("="*50)
+    
+    for måned, kategorier in sorted(kategori_omsætning.items()):
+        # Sorter kategorier efter omsætning
+        sorteret_kategorier = sorted(kategorier.items(), key=lambda x: x[1], reverse=True)
+        
+        print_status(f"\nMåned: {måned}", 'info')
+        for kategori, omsætning in sorteret_kategorier[:5]:  # Vis top 5
+            print_status(f"  {kategori}: {omsætning:.2f} kr", 'success')
+
+def vis_top_ugedage(data):
+    """
+    Viser omsætning pr. ugedag
+    """
+    ugedags_omsætning = analyser_ugedags_omsætning(data)
+    
+    if not ugedags_omsætning:
+        print_status("Ingen ugedags data fundet", 'warning')
+        return
+    
+    print_status("\nOmsætning pr. ugedag:", 'info')
+    print("="*50)
+    
+    # Sorter ugedage efter omsætning
+    sorteret_ugedage = sorted(ugedags_omsætning.items(), key=lambda x: x[1], reverse=True)
+    
+    for ugedag, omsætning in sorteret_ugedage:
+        print_status(f"  {ugedag}: {omsætning:.2f} kr", 'success')
+
+def analyser_ugedags_omsætning(data):
+    """
+    Analyserer omsætning pr. ugedag
+    Returnerer en dictionary med ugedag som nøgle og omsætning som værdi
+    """
+    print_status("DEBUG: Starter ugedagsanalyse", 'info')
+    print_status(f"DEBUG: Antal datapunkter modtaget: {len(data)}", 'info')
+    
+    ugedags_omsætning = {
+        'Mandag': 0,
+        'Tirsdag': 0,
+        'Onsdag': 0,
+        'Torsdag': 0,
+        'Fredag': 0,
+        'Lørdag': 0,
+        'Søndag': 0
+    }
+    
+    ugedag_oversættelse = {
+        0: 'Mandag',
+        1: 'Tirsdag',
+        2: 'Onsdag',
+        3: 'Torsdag',
+        4: 'Fredag',
+        5: 'Lørdag',
+        6: 'Søndag'
+    }
+    
+    for item in data:
+        print_status(f"DEBUG: Behandler item: {item.get('dato', 'Ingen dato')}", 'info')
+        if not isinstance(item, dict) or 'data' not in item or 'dato' not in item:
+            print_status("DEBUG: Item mangler nødvendige felter", 'warning')
+            continue
+            
+        df = item['data']
+        print_status(f"DEBUG: DataFrame kolonner: {df.columns.tolist()}", 'info')
+        df.columns = [col.lower().strip() for col in df.columns]
+        
+        try:
+            # Konverter dato streng til datetime objekt
+            dato = datetime.strptime(item['dato'], '%Y-%m-%d')
+            # Find ugedagen (0 = Mandag, 1 = Tirsdag, etc.)
+            ugedag_nummer = dato.weekday()
+            ugedag = ugedag_oversættelse[ugedag_nummer]
+            
+            # Sum omsætning for dagen
+            if 'i alt' not in df.columns:
+                print_status(f"DEBUG: 'i alt' kolonne ikke fundet. Tilgængelige kolonner: {df.columns.tolist()}", 'warning')
+                continue
+                
+            dagens_omsætning = df['i alt'].sum()
+            print_status(f"DEBUG: {ugedag}: Omsætning for {dato}: {dagens_omsætning}", 'info')
+            ugedags_omsætning[ugedag] += dagens_omsætning
+            
+        except Exception as e:
+            print_status(f"Fejl ved behandling af dato {item['dato']}: {str(e)}", 'warning')
+            continue
+    
+    print_status("DEBUG: Færdig med ugedagsanalyse", 'info')
+    print_status("DEBUG: Resultater:", 'info')
+    for ugedag, omsætning in ugedags_omsætning.items():
+        print_status(f"DEBUG: {ugedag}: {omsætning}", 'info')
+    
+    return ugedags_omsætning
+
+def tilføj_top20_til_måned(worksheet, data, workbook, start_row):
+    """Tilføjer Top 20 analyser til en specifik måneds ark"""
+    # Formatering
+    header_format = workbook.add_format({
+        'bold': True,
+        'bg_color': '#1a237e',
+        'font_color': 'white',
+        'border': 0,
+        'align': 'center',
+        'font_size': 12,
+        'font_name': 'Helvetica Neue',
+        'bottom': 2,
+        'bottom_color': '#E0E0E0'
+    })
+    
+    data_format = workbook.add_format({
+        'font_name': 'Helvetica Neue',
+        'font_size': 11,
+        'align': 'right',
+        'num_format': '#,##0.00 kr'
+    })
+    
+    antal_format = workbook.add_format({
+        'font_name': 'Helvetica Neue',
+        'font_size': 11,
+        'align': 'right',
+        'num_format': '#,##0'
+    })
+    
+    current_row = start_row + 2  # Tilføj mellemrum før Top 20 analyse
+    
+    # Filtrer data for januar 2025
+    januar_data = []
+    for item in data:
+        dato = item['dato']
+        # Check both possible date formats
+        if dato.startswith('2025-01') or dato.startswith('25-01') or dato.startswith('01-25'):
+            df = item['data']
+            df['dato'] = dato
+            januar_data.append(df)
+    
+    if not januar_data:
+        return current_row
+    
+    # Saml al januar data i én DataFrame
+    samlet_df = pd.concat(januar_data, ignore_index=True)
+    
+    # Konverter kolonnenavne til lowercase
+    samlet_df.columns = [col.lower().strip() for col in samlet_df.columns]
+    
+    # Filter out total rows before calculations
+    samlet_df = samlet_df[~samlet_df['produktnavn'].str.lower().str.contains('total', na=False)]
+    
+    # 1. Top 20 Produkter efter omsætning
+    worksheet.write(current_row, 0, 'Top 20 Produkter - Januar 2025', header_format)
+    current_row += 1
+    
+    # Skriv overskrifter
+    worksheet.write(current_row, 0, 'Produkt', header_format)
+    worksheet.write(current_row, 1, 'Antal Solgt', header_format)
+    worksheet.write(current_row, 2, 'Total Omsætning', header_format)
+    current_row += 1
+    
+    # Gruppér efter produkt og beregn statistik
+    produkt_stats = samlet_df.groupby('produktnavn').agg({
+        'salg': 'sum',
+        'i alt': 'sum'
+    }).reset_index()
+    
+    # Sorter efter omsætning og tag top 20
+    top_products = produkt_stats.nlargest(20, 'i alt')
+    
+    # Skriv produkt data
+    for _, row in top_products.iterrows():
+        worksheet.write(current_row, 0, row['produktnavn'])
+        worksheet.write(current_row, 1, float(row['salg']), antal_format)
+        worksheet.write(current_row, 2, float(row['i alt']), data_format)
+        current_row += 1
+    
+    current_row += 2  # Tilføj mellemrum
+    
+    # 2. Top 20 Kategorier efter omsætning
+    worksheet.write(current_row, 0, 'Top 20 Kategorier - Januar 2025', header_format)
+    current_row += 1
+    
+    # Skriv overskrifter
+    worksheet.write(current_row, 0, 'Kategori', header_format)
+    worksheet.write(current_row, 1, 'Antal Solgt', header_format)
+    worksheet.write(current_row, 2, 'Total Omsætning', header_format)
+    current_row += 1
+    
+    # Gruppér efter kategori
+    kategori_stats = samlet_df.groupby('kategorinavn').agg({
+        'salg': 'sum',
+        'i alt': 'sum'
+    }).reset_index()
+    
+    # Sorter efter omsætning og tag top 20
+    top_20_kategorier = kategori_stats.nlargest(20, 'i alt')
+    
+    # Skriv kategori data
+    for _, row in top_20_kategorier.iterrows():
+        worksheet.write(current_row, 0, row['kategorinavn'])
+        worksheet.write(current_row, 1, float(row['salg']), antal_format)
+        worksheet.write(current_row, 2, float(row['i alt']), data_format)
+        current_row += 1
+    
+    current_row += 2  # Tilføj mellemrum
+    
+    # 3. Top 20 Salgsdage i Januar
+    worksheet.write(current_row, 0, 'Top 20 Salgsdage - Januar 2025', header_format)
+    current_row += 1
+    
+    # Skriv overskrifter
+    worksheet.write(current_row, 0, 'Dato', header_format)
+    worksheet.write(current_row, 1, 'Antal Salg', header_format)
+    worksheet.write(current_row, 2, 'Total Omsætning', header_format)
+    current_row += 1
+    
+    # Gruppér efter dato
+    dag_stats = samlet_df.groupby('dato').agg({
+        'salg': 'sum',
+        'i alt': 'sum'
+    }).reset_index()
+    
+    # Sorter efter omsætning og tag top 20
+    top_20_dage = dag_stats.nlargest(20, 'i alt')
+    
+    # Skriv dags data
+    for _, row in top_20_dage.iterrows():
+        worksheet.write(current_row, 0, formater_dato(row['dato']))
+        worksheet.write(current_row, 1, float(row['salg']), antal_format)
+        worksheet.write(current_row, 2, float(row['i alt']), data_format)
+        current_row += 1
+    
+    # Juster kolonnebredder
+    worksheet.set_column(0, 0, 40)  # Produkt/Kategori/Dato kolonne
+    worksheet.set_column(1, 1, 15)  # Antal kolonne
+    worksheet.set_column(2, 2, 20)  # Omsætning kolonne
+    
+    return current_row
+
+def udtræk_gram_fra_navn(produktnavn, kategori=''):
+    """
+    Udtrækker gram-mængde fra produktnavn og kategori
+    """
+    try:
+        produktnavn = produktnavn.lower()
+        kategori = kategori.lower()
+        
+        # Kendte kategori-formater
+        kategori_gram = {
+            'pre-pack 5g': 5,
+            'pre-pack 10g': 10,
+            'solid (5g pr stk)': 5,
+            'solid 5g': 5,
+            'gnallinger - pre pack 5g': 5,
+            'gnallinger 1g': 1,
+            'blomst 5g': 5,
+            'solid (7g pr stk)': 7,
+            'pre-pack (40kr/pr g)': 5,  # Vi ved dette er 5g
+            'pre-pack (38kr/pr g)': 10,  # Vi ved dette er 10g
+            'urtemix 7g': 7
+        }
+        
+        # Tjek først for eksakte matches i kategori
+        for kat_navn, gram in kategori_gram.items():
+            if kat_navn in kategori:
+                print_status(f"DEBUG: Fandt gram fra kategori match: {kategori} -> {gram}g", 'info')
+                return gram
+        
+        # Tjek derefter for specifikke produkt-typer
+        if 'pre-pack' in produktnavn or 'pre-pack' in kategori:
+            if '5g' in produktnavn or '(40kr/pr g)' in produktnavn or '5g' in kategori:
+                return 5
+            elif '10g' in produktnavn or '(38kr/pr g)' in produktnavn or '10g' in kategori:
+                return 10
+                
+        # Gnallinger
+        if 'gnalling' in produktnavn or 'gnalling' in kategori:
+            if '5g' in produktnavn or '5g' in kategori:
+                print_status(f"DEBUG: Fandt Gnalling 5g: {produktnavn}", 'info')
+                return 5
+            elif '1g' in produktnavn or '1g' in kategori:
+                print_status(f"DEBUG: Fandt Gnalling 1g: {produktnavn}", 'info')
+                return 1
+        
+        # Solid produkter
+        if 'solid' in produktnavn or 'solid' in kategori:
+            print_status(f"DEBUG: Fandt Solid produkt: {produktnavn}", 'info')
+            return 5
+        
+        # Putte hash
+        if 'putte hash' in produktnavn or 'putte hash' in kategori:
+            print_status(f"DEBUG: Fandt Putte hash: {produktnavn}", 'info')
+            return 5
+        
+        # Generel gram-søgning i både navn og kategori
+        for tekst in [produktnavn, kategori]:
+            matches = re.findall(r'(\d+)\s*g(?:ram)?', tekst)
+            if matches:
+                gram = int(matches[0])
+                print_status(f"DEBUG: Fandt gram via regex: {tekst} -> {gram}g", 'info')
+                return gram
+        
+        print_status(f"DEBUG: Ingen gram fundet for: {produktnavn} (Kategori: {kategori})", 'warning')
+        return None
+        
+    except Exception as e:
+        print_status(f"Fejl ved gram-udtrækning for {produktnavn}: {str(e)}", 'error')
+        return None
+
+def tilføj_forecast_analyse(workbook, måneder_data, header_format):
+    try:
+        worksheet_forecast = workbook.add_worksheet('Forecast')
+        
+        # Formatering
+        antal_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'right',
+            'num_format': '#,##0'
+        })
+        
+        tekst_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'left'
+        })
+        
+        # Tilføj prioritets-formater med farver
+        høj_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'center',
+            'bg_color': '#92D050',  # Grøn
+            'border': 1
+        })
+        
+        medium_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'center',
+            'bg_color': '#FFEB9C',  # Gul
+            'border': 1
+        })
+        
+        lav_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'center',
+            'bg_color': '#FF9B9B',  # Rød
+            'border': 1
+        })
+        
+        beløb_format = workbook.add_format({
+            'font_name': 'Helvetica Neue',
+            'font_size': 11,
+            'align': 'right',
+            'num_format': '#,##0.00 kr'
+        })
+        
+        # Overskrifter
+        headers = ['Produktnavn', 'Gns. Månedligt Salg (stk)', 'Gns. Månedligt Salg (g)', 
+                  'Max Månedligt Salg (stk)', 'Gns. Månedlig Omsætning', 
+                  'Anbefalet Lagerbeholdning (stk)', 'Anbefalet Lagerbeholdning (g)', 
+                  'Prioritet', 'Bemærkninger']
+        
+        for col, header in enumerate(headers):
+            worksheet_forecast.write(0, col, header, header_format)
+        
+        # Saml al salgsdata først
+        alle_gns_salg = []
+        alle_omsætninger = []
+        produkt_statistik = {}
+        
+        # Første gennemgang for at samle data og beregne grænser
+        for måned_navn, måned_data in måneder_data.items():
+            for item in måned_data:
+                df = item['data']
+                df.columns = [col.lower().strip() for col in df.columns]
+                df_uden_total = df[~df['produktnavn'].str.lower().str.contains('total', na=False)]
+                
+                for _, row in df_uden_total.iterrows():
+                    produkt = str(row['produktnavn']).strip()
+                    if pd.isna(produkt) or produkt == 'nan':
+                        continue
+                        
+                    antal = float(row['salg']) if pd.notna(row['salg']) else 0
+                    omsætning = float(row['i alt']) if pd.notna(row['i alt']) else 0
+                    
+                    if produkt not in produkt_statistik:
+                        produkt_statistik[produkt] = {
+                            'månedlige_salg': [],
+                            'månedlige_omsætninger': [],
+                            'kategori': str(row['kategorinavn']).strip()
+                        }
+                    
+                    produkt_statistik[produkt]['månedlige_salg'].append(antal)
+                    produkt_statistik[produkt]['månedlige_omsætninger'].append(omsætning)
+
+        # Beregn gennemsnit og grænser
+        for produkt, data in produkt_statistik.items():
+            gns_salg = sum(data['månedlige_salg']) / len(data['månedlige_salg'])
+            gns_omsætning = sum(data['månedlige_omsætninger']) / len(data['månedlige_omsætninger'])
+            alle_gns_salg.append(gns_salg)
+            alle_omsætninger.append(gns_omsætning)
+
+        # Beregn grænser
+        høj_antal_grænse = np.percentile(alle_gns_salg, 75)
+        medium_antal_grænse = np.percentile(alle_gns_salg, 50)
+        høj_omsætning_grænse = np.percentile(alle_omsætninger, 75)
+        medium_omsætning_grænse = np.percentile(alle_omsætninger, 50)
+
+        # Initialiser række-tæller
+        række = 1
+        
+        # Skriv data
+        for produkt, data in produkt_statistik.items():
+            gram_per_stk = udtræk_gram_fra_navn(produkt, data['kategori'])  # Send både navn og kategori
+            gns_salg = sum(data['månedlige_salg']) / len(data['månedlige_salg'])
+            max_salg = max(data['månedlige_salg'])
+            gns_omsætning = sum(data['månedlige_omsætninger']) / len(data['månedlige_omsætninger'])
+            
+            # Beregn gram hvis muligt
+            gns_salg_gram = gns_salg * gram_per_stk if gram_per_stk else None
+            anbefalet_lager_gram = None  # Initialiser variablen her
+            
+            # Bestem prioritet og anbefalet lager
+            if 'pre-pack' in data['kategori'].lower():
+                anbefalet_lager = max(max_salg * 1.5, gns_salg * 2)
+                if gram_per_stk:
+                    anbefalet_lager_gram = anbefalet_lager * gram_per_stk
+                bemærkning = f"Pre-pack ({gram_per_stk}g pr stk)" if gram_per_stk else "Pre-pack"
+            elif 'blomster' in data['kategori'].lower():
+                anbefalet_lager = max(max_salg * 1.2, gns_salg * 1.5)
+                bemærkning = "Blomster"
+            else:
+                anbefalet_lager = max(max_salg * 1.3, gns_salg * 1.8)
+                if gram_per_stk:
+                    anbefalet_lager_gram = anbefalet_lager * gram_per_stk
+                bemærkning = f"Solid ({gram_per_stk}g pr stk)" if gram_per_stk else "Standard"
+            
+            # Skriv data til Excel med gram-format
+            gram_format = workbook.add_format({
+                'font_name': 'Helvetica Neue',
+                'font_size': 11,
+                'align': 'right',
+                'num_format': '#,##0 "g"',
+                'bold': True
+            })
+            
+            col = 0
+            worksheet_forecast.write(række, col, produkt, tekst_format); col += 1
+            worksheet_forecast.write(række, col, round(gns_salg, 1), antal_format); col += 1
+            worksheet_forecast.write(række, col, round(gns_salg_gram, 1) if gns_salg_gram else "N/A", gram_format); col += 1
+            worksheet_forecast.write(række, col, round(max_salg, 1), antal_format); col += 1
+            worksheet_forecast.write(række, col, round(gns_omsætning, 2), beløb_format); col += 1
+            worksheet_forecast.write(række, col, round(anbefalet_lager, 0), antal_format); col += 1
+            worksheet_forecast.write(række, col, round(anbefalet_lager_gram, 0) if anbefalet_lager_gram else "N/A", gram_format); col += 1
+            
+            # Skriv prioritet med farve
+            if gns_salg >= høj_antal_grænse and gns_omsætning >= høj_omsætning_grænse:
+                worksheet_forecast.write(række, col, "Høj", høj_format)
+            elif gns_salg >= medium_antal_grænse and gns_omsætning >= medium_omsætning_grænse:
+                worksheet_forecast.write(række, col, "Medium", medium_format)
+            else:
+                worksheet_forecast.write(række, col, "Lav", lav_format)
+            col += 1
+            
+            worksheet_forecast.write(række, col, bemærkning, tekst_format)
+            
+            række += 1
+        
+        # Juster kolonnebredder
+        worksheet_forecast.set_column(0, 0, 40)  # Produktnavn
+        worksheet_forecast.set_column(1, 6, 25)  # Tal kolonner
+        worksheet_forecast.set_column(7, 7, 15)  # Prioritet
+        worksheet_forecast.set_column(8, 8, 40)  # Bemærkninger
+        
+        # Opdater noterne med de faktiske grænser
+        note_række = række + 2
+        worksheet_forecast.write(note_række, 0, "Noter til lagerberegning:", header_format)
+        noter = [
+            "• Anbefalet lagerbeholdning er baseret på historisk salg med følgende faktorer:",
+            "  - Pre-pack produkter: 150-200% af maksimalt månedligt salg",
+            "  - Blomster: 120-150% af maksimalt månedligt salg",
+            "  - Standard produkter: 130-180% af maksimalt månedligt salg",
+            "",
+            "• Prioritering er baseret på statistisk analyse af data:",
+            f"  - Høj: Top 25% i både antal (>{round(høj_antal_grænse,1)} stk) og omsætning (>{round(høj_omsætning_grænse,2)} kr)",
+            f"  - Medium: Top 50% i både antal (>{round(medium_antal_grænse,1)} stk) og omsætning (>{round(medium_omsætning_grænse,2)} kr)",
+            "  - Lav: Under median i enten antal eller omsætning"
+        ]
+        
+        for i, note in enumerate(noter):
+            worksheet_forecast.write(note_række + 1 + i, 0, note, tekst_format)
+        
+        print_status("Forecast fane tilføjet med lageranalyse", 'success')
+        
+        # Når vi skriver data til Excel
+        for produkt, data in produkt_statistik.items():
+            gram_per_stk = udtræk_gram_fra_navn(produkt, data['kategori'])
+            print_status(f"DEBUG: Produkt: {produkt}, Gram per stk: {gram_per_stk}", 'info')
+            
+            # ... (resten af koden for at skrive data)
+            
+            # Når vi skriver gram-kolonnerne
+            if gram_per_stk:
+                gns_salg_gram = gns_salg * gram_per_stk
+                anbefalet_lager_gram = anbefalet_lager * gram_per_stk
+                print_status(f"DEBUG: {produkt}: {gns_salg} stk * {gram_per_stk}g = {gns_salg_gram}g", 'info')
+            else:
+                gns_salg_gram = None
+                anbefalet_lager_gram = None
+                print_status(f"DEBUG: {produkt}: Ingen gram-beregning mulig", 'warning')
+            
+            # Skriv gram-kolonnerne med tydelig formatering
+            gram_format = workbook.add_format({
+                'font_name': 'Helvetica Neue',
+                'font_size': 11,
+                'align': 'right',
+                'num_format': '#,##0 "g"',  # Tilføj "g" til tallet
+                'bold': True  # Gør tallet fed
+            })
+            
+            # Skriv gram-værdier
+            worksheet_forecast.write(række, 2, gns_salg_gram if gns_salg_gram else "N/A", gram_format)
+            worksheet_forecast.write(række, 6, anbefalet_lager_gram if anbefalet_lager_gram else "N/A", gram_format)
+            
+            # ... (resten af koden forbliver uændret)
+        
+        # Efter al data er skrevet, beregn og sæt optimale kolonnebredder
+        
+        # Definer minimum og maximum bredder for forskellige kolonnetyper
+        kolonnebredder = {
+            0: {'min': 40, 'max': 60},  # Produktnavn
+            1: {'min': 25, 'max': 30},  # Gns. Månedligt Salg (stk)
+            2: {'min': 25, 'max': 30},  # Gns. Månedligt Salg (g)
+            3: {'min': 25, 'max': 30},  # Max Månedligt Salg (stk)
+            4: {'min': 25, 'max': 35},  # Gns. Månedlig Omsætning
+            5: {'min': 25, 'max': 35},  # Anbefalet Lagerbeholdning (stk)
+            6: {'min': 25, 'max': 35},  # Anbefalet Lagerbeholdning (g)
+            7: {'min': 15, 'max': 20},  # Prioritet
+            8: {'min': 40, 'max': 60}   # Bemærkninger
+        }
+        
+        # Brug de foruddefinerede bredder i stedet for at beregne dem
+        for col, specs in kolonnebredder.items():
+            worksheet_forecast.set_column(col, col, specs['min'])
+        
+        # Tilpas visning
+        worksheet_forecast.set_zoom(100)
+        worksheet_forecast.freeze_panes(1, 0)  # Frys første række
+        worksheet_forecast.autofilter(0, 0, række-1, len(headers)-1)  # Tilføj filtrering
+        
+        print_status("Forecast fane tilføjet med optimerede kolonnebredder", 'success')
+        
+    except Exception as e:
+        print_status(f"Fejl ved oprettelse af forecast fane: {str(e)}", 'error')
+
+def main():
+    print_status("\n=== Raske Ordre Management System ===\n", 'info')
+    
+    # Angiv stier
+    mappe_sti = "/Users/janathampirajah/Downloads/Raske Ordre Managment/Butik"
+    output_sti = "/Users/janathampirajah/Downloads/Raske Ordre Managment/Salgsrapport.xlsx"
+    
+    print_status(f"Starter scanning af: {mappe_sti}\n", 'info')
+    
+    # Læs alle salgsfiler
+    salgsdata = læs_salgsdata(mappe_sti)
+    
+    # Vis top kategorier
+    vis_top_kategorier(salgsdata)
+    
+    # Vis top ugedage
+    vis_top_ugedage(salgsdata)
+    
+    # Gem rapport til Excel
+    gem_salgsrapport(salgsdata, output_sti)
+    
+    # Kald funktionen efter at have læst data
+    interaktiv_pre_pack_kategorisering(salgsdata)
+    anvend_pre_pack_kategorisering(salgsdata)
+    
+    print_status("\nAnalyse færdig!", 'success')
+
+if __name__ == "__main__":
+    main()
